@@ -1,0 +1,10 @@
+.body { font-family: Inter, Roboto, Arial, sans-serif; }
+.file-list { list-style: none; padding: 0; margin: 0; }
+.file-list li { padding: 8px; border-bottom: 1px solid #f2f2f2; cursor: pointer; }
+.file-list li:hover { background: #fafafa; }
+.requests { max-height: 50vh; overflow: auto; }
+.request-item { padding: 6px 8px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; }
+.timeline { margin-top: 12px; }
+.timeline-bar { background: #f3f6fb; height: 32px; position: relative; border-radius: 4px; }
+.segment { position: absolute; height: 100%; color: #fff; display:flex; align-items:center; justify-content:center; font-size:12px; }
+
