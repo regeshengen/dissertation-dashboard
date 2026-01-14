@@ -1,15 +1,35 @@
 import React from 'react'
 
+// deterministic color mapping for services: prefer explicit map, fall back to palette by hash
 function colorForService(name) {
-  const map = {
+  if (!name) return '#94a3b8'
+  const normalize = n => (n || '').toString()
+  const base = {
     'mystack_user-publication-service': '#2f86eb',
+    'user-publication-service': '#2f86eb',
     'mystack_user-auth-service': '#f59e0b',
+    'user-auth-service': '#f59e0b',
     'mystack_get-data': '#10b981',
+    'get-data': '#10b981',
     'mystack_optimize-data': '#8b5cf6',
+    'optimize-data': '#8b5cf6',
     'mystack_upload-data': '#ef4444',
-    'mystack_mongo': '#6b7280'
+    'upload-data': '#ef4444',
+    'mystack_mongo': '#6b7280',
+    'mongo': '#6b7280'
   }
-  return map[name] || '#94a3b8'
+  const n = normalize(name)
+  if (base[n]) return base[n]
+  // try without mystack_ prefix
+  const stripped = n.replace(/^mystack_/, '')
+  if (base[stripped]) return base[stripped]
+
+  const palette = ['#06b6d4','#fb7185','#f97316','#84cc16','#a78bfa','#c084fc','#fdba74','#60a5fa','#34d399','#f472b6']
+  // simple deterministic hash
+  let h = 0
+  for (let i = 0; i < n.length; i++) h = ((h << 5) - h) + n.charCodeAt(i)
+  const idx = Math.abs(h) % palette.length
+  return palette[idx]
 }
 
 export default function RequestTimeline({ events = [], serviceFlow = [] }) {
@@ -24,91 +44,157 @@ export default function RequestTimeline({ events = [], serviceFlow = [] }) {
     byService[ev.service].push(ev)
   }
 
-  // build segments in order of serviceFlow
-  const segments = []
-  let lastT = null
-  for (const svc of serviceFlow) {
-    const evs = byService[svc]
-    if (!evs || evs.length === 0) continue
-    // pick first and last occurrence
-    // prefer high-precision timeMs
-    const first = evs.find(e => e.timeMs != null) || evs.find(e => e.time) || evs[0]
-    const idx = evs.map(e => (e.timeMs != null ? e.timeMs : (e.time && e.time.getTime()))).filter(t => t != null)
-    const lastVal = idx.length ? Math.max(...idx) : (first && (first.timeMs != null ? first.timeMs : (first.time && first.time.getTime())))
-    const s = (first && (first.timeMs != null ? first.timeMs : (first.time && first.time.getTime()))) || lastT
-    const e = lastVal || s
-    // preserve raw strings
-    const startRaw = first && (first.rawTimestamp || first.timestamp || null)
-    let endRaw = null
-    for (const ev of evs) {
-      const t = (ev.timeMs != null ? ev.timeMs : (ev.time && ev.time.getTime()))
-      if (t === lastVal) { endRaw = ev.rawTimestamp || ev.timestamp || null; break }
+  // We'll build the timeline using only the sequence order of events (CSV order), ignoring timestamps.
+  // Attach an `__order` index to preserve the original sequence and filter events that have a service.
+  const orderedEvents = events
+    .map((e, idx) => ({ ...e, __order: idx }))
+    .filter(e => e && e.service)
+
+  // Build segments by grouping events by `requestId`.
+  // For each requestId we compute start = earliest timestamp, end = latest timestamp.
+  const requestsMap = {}
+  for (const ev of orderedEvents) {
+    const id = ev.requestId || ev.requestID || ev.requestid || ev.request || ev.request_id
+    if (!id) continue
+    if (!requestsMap[id]) requestsMap[id] = []
+    requestsMap[id].push(ev)
+  }
+  const requestTotals = []
+  const serviceSegments = []
+  // For each request, compute overall start/end and also break into consecutive service segments
+  for (const id of Object.keys(requestsMap)) {
+    // events already stored in original sequence order
+    const evs = requestsMap[id]
+    if (!evs.length) continue
+    const reqStartIdx = evs[0].__order
+    const reqEndIdx = evs[evs.length - 1].__order
+    const reqStartRaw = evs[0].rawTimestamp || evs[0].timestamp || null
+    const reqEndRaw = evs[evs.length - 1].rawTimestamp || evs[evs.length - 1].timestamp || null
+    requestTotals.push({ requestId: id, startIdx: reqStartIdx, endIdx: reqEndIdx, startRaw: reqStartRaw, endRaw: reqEndRaw, events: evs })
+
+    // group consecutive events of the same service within this request using sequence indices
+    for (let i = 0; i < evs.length; ) {
+      const cur = evs[i]
+      const svc = cur.service
+      const segStartIdx = cur.__order
+      let j = i
+      while (j + 1 < evs.length && evs[j + 1].service === svc) j++
+      const segEndIdx = evs[j].__order
+      const segStartRaw = cur.rawTimestamp || cur.timestamp || null
+      const segEndRaw = evs[j].rawTimestamp || evs[j].timestamp || null
+      serviceSegments.push({ requestId: id, service: svc, startIdx: segStartIdx, endIdx: segEndIdx, startRaw: segStartRaw, endRaw: segEndRaw })
+      i = j + 1
     }
-    segments.push({ service: svc, start: s, end: e, startRaw, endRaw })
-    lastT = e
   }
 
-  // compute display bounds using only segments that have duration (end > start)
-  const durationSegments = segments.filter(s => s.start != null && s.end != null && s.end > s.start)
+  // helper to parse timestamp-like values into ms since epoch (or null)
+  function parseTimeVal(v) {
+    if (v == null) return null
+    if (v instanceof Date) return v.getTime()
+    if (typeof v === 'number' && !isNaN(v)) return v
+    const s = String(v)
+    const n = Date.parse(s)
+    if (!isNaN(n)) return n
+    return null
+  }
+
+  // compute per-request total durations (ms) when raw timestamps are available
+  const requestDurationMap = {}
+  for (const rt of requestTotals) {
+    const s = parseTimeVal(rt.startRaw)
+    const e = parseTimeVal(rt.endRaw)
+    requestDurationMap[rt.requestId] = (s != null && e != null) ? Math.round(e - s) : null
+  }
+
+  // chronoSegments are service-level segments (ordered by time)
+  // chronoSegments ordered by sequence index
+  const chronoSegments = serviceSegments.slice().sort((a,b) => a.startIdx - b.startIdx)
+
+  // include all segments with defined indices
+  const displaySegments = chronoSegments.filter(s => s.startIdx != null && s.endIdx != null)
   let displayStart = null, displayEnd = null
-  if (durationSegments.length) {
-    const allStarts = durationSegments.map(s => s.start)
-    const allEnds = durationSegments.map(s => s.end)
-    displayStart = Math.min(...allStarts)
-    displayEnd = Math.max(...allEnds)
-  } else if (times.length) {
-    displayStart = Math.min(...times)
-    displayEnd = Math.max(...times)
+  if (displaySegments.length) {
+    displayStart = Math.min(...displaySegments.map(s => s.startIdx))
+    displayEnd = Math.max(...displaySegments.map(s => s.endIdx))
+  } else if (orderedEvents.length) {
+    displayStart = 0
+    displayEnd = orderedEvents.length - 1
   }
-  const total = displayStart != null && displayEnd != null ? (displayEnd - displayStart) : 0
-  // sum of individual service durations (what the user wants as TOTAL)
-  const sumDurations = durationSegments.reduce((acc, s) => acc + Math.max(0, (s.end - s.start)), 0)
 
-  // display-friendly start (earliest segment start) and end (upload-data end if available)
-  const startDisplay = durationSegments.length
-    ? (durationSegments.reduce((a,b)=> a.start < b.start ? a : b).startRaw || new Date(displayStart).toISOString())
-    : (displayStart ? new Date(displayStart).toISOString() : '—')
+  const totalUnits = (displayStart != null && displayEnd != null) ? (displayEnd - displayStart + 1) : 0
 
-  const uploadSeg = segments.find(s => s.service === 'mystack_upload-data')
-  const mongoSeg = segments.find(s => s.service === 'mystack_mongo')
-  // prefer upload-data segment end, then mongo, then displayEnd
-  const endDisplay = (uploadSeg && (uploadSeg.endRaw || (uploadSeg.end ? new Date(uploadSeg.end).toISOString() : null))) || (mongoSeg && (mongoSeg.endRaw || (mongoSeg.end ? new Date(mongoSeg.end).toISOString() : null))) || (displayEnd ? new Date(displayEnd).toISOString() : '—')
-
-  // numeric start/end for computing the displayed Total = End - Start
-  const numericStart = displayStart != null ? displayStart : null
-  const numericEnd = (uploadSeg && uploadSeg.end != null) ? uploadSeg.end : ((mongoSeg && mongoSeg.end != null) ? mongoSeg.end : (displayEnd != null ? displayEnd : null))
-  const displayedTotalMs = (numericStart != null && numericEnd != null) ? Math.round(numericEnd - numericStart) : null
+  // display-friendly start/end are sequence positions (we're ignoring timestamps for now)
+  const startDisplay = displayStart != null ? `#${displayStart}` : '—'
+  const endDisplay = displayEnd != null ? `#${displayEnd}` : '—'
+  const displayedTotalSteps = totalUnits
 
   return (
-    <div>
+    <><div>
       <h3>Request timeline</h3>
-  <div>Start: {startDisplay} | End: {endDisplay} | Total: {displayedTotalMs != null ? displayedTotalMs + ' ms' : '—'}</div>
+      <div>Start: {startDisplay} | End: {endDisplay} | Total: {displayedTotalSteps != null ? displayedTotalSteps + ' steps' : '—'}</div>
 
       <div className="timeline">
         <div className="timeline-bar">
-          {durationSegments.map((seg, i) => {
-            const left = total ? ((seg.start - displayStart) / total) * 100 : 0
-            const width = total ? ((seg.end - seg.start) / total) * 100 : 0
+          {displaySegments.map((seg, i) => {
+            const left = totalUnits ? ((seg.startIdx - displayStart) / totalUnits) * 100 : 0
+            const width = totalUnits ? ((seg.endIdx - seg.startIdx + 1) / totalUnits) * 100 : 0
+            const bg = colorForService(seg.service)
+            const label = seg.service ? seg.service.replace('mystack_', '') : ''
             return (
-              <div key={i} className="segment" style={{ left: `${left}%`, width: `${Math.max(width,1)}%`, background: colorForService(seg.service) }}>
-                <span style={{padding:'0 6px', whiteSpace:'nowrap', fontSize:12}}>{seg.service.replace('mystack_','')}</span>
+              <div key={i} className="segment" title={`${seg.requestId} [${seg.startIdx}→${seg.endIdx}] ${label}`} style={{ left: `${left}%`, width: `${Math.max(width, 1)}%`, background: bg }}>
+                <span style={{ padding: '0 6px', whiteSpace: 'nowrap', fontSize: 12 }}>{label}</span>
               </div>
             )
           })}
         </div>
+        {/* labels below each segment: start / end of the request (if available) */}
       </div>
 
-      <div style={{marginTop:10}}>
+      <div style={{ position: 'relative', marginTop: 6, height: 34 }}>
+        {displaySegments.map((seg, i) => {
+          const left = totalUnits ? ((seg.startIdx - displayStart) / totalUnits) * 100 : 0
+          const width = totalUnits ? ((seg.endIdx - seg.startIdx + 1) / totalUnits) * 100 : 0
+          const startText = seg.startRaw ? (seg.startRaw instanceof Date ? seg.startRaw.toISOString() : String(seg.startRaw)) : '—'
+          const endText = seg.endRaw ? (seg.endRaw instanceof Date ? seg.endRaw.toISOString() : String(seg.endRaw)) : '—'
+          // compute duration for the sub-segment using its own startRaw/endRaw
+          const segStartMs = parseTimeVal(seg.startRaw)
+          const segEndMs = parseTimeVal(seg.endRaw)
+          const segDur = (segStartMs != null && segEndMs != null) ? Math.round(segEndMs - segStartMs) : null
+          const durText = segDur != null ? (segDur > 1000 ? `${(segDur/1000).toFixed(2)} s` : `${segDur} ms`) : (requestDurationMap[seg.requestId] != null ? (requestDurationMap[seg.requestId] > 1000 ? `${(requestDurationMap[seg.requestId]/1000).toFixed(2)} s` : `${requestDurationMap[seg.requestId]} ms`) : '—')
+          return (
+            <div key={i} style={{ position: 'absolute', left: `${left}%`, width: `${Math.max(width, 1)}%`, padding: '2px 4px', boxSizing: 'border-box', textAlign: 'center', fontSize: 11, color: '#444', overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>
+              <div style={{ fontSize: 11, color: '#333' }}>{startText}</div>
+              <div style={{ fontSize: 11, color: '#666' }}>{endText}</div>
+              <div style={{ fontSize: 11, color: '#000', marginTop:2 }}>{durText}</div>
+            </div>
+          )
+        })}
+      </div>
+    </div><div style={{ marginTop: 8 }}>
+        <h4>Request durations</h4>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 200, overflow: 'auto' }}>
+          {requestTotals.slice().sort((a, b) => a.startIdx - b.startIdx).map((s, idx) => {
+            const rid = s.requestId || ''
+            const shortId = rid.length > 12 ? `${rid.slice(0, 12)}…` : rid
+            const steps = (s.endIdx - s.startIdx + 1)
+            return (
+              <div key={idx} style={{ fontSize: 13, color: '#222' }}>
+                <strong style={{ fontFamily: 'monospace' }}>{shortId}</strong>: {steps} steps
+              </div>
+            )
+          })}
+        </div>
+      </div><div style={{ marginTop: 10 }}>
         <h4>Raw events</h4>
-        <div style={{maxHeight:300, overflow:'auto', background:'#fff', border:'1px solid #eee', padding:8}}>
-          {events.map((e,i) => (
-            <div key={i} style={{padding:'6px 0', borderBottom:'1px solid #fafafa'}}>
-              <div style={{fontSize:12,color:'#666'}}>{(e.rawTimestamp || e.timestamp) ? (e.rawTimestamp || e.timestamp) : (e.time ? e.time.toISOString() : '—')} | {e.vm || '—'} | {e.service || '—'}</div>
-              <div style={{fontSize:13}}>{e.message}</div>
+        <div style={{ maxHeight: 300, overflow: 'auto', background: '#fff', border: '1px solid #eee', padding: 8 }}>
+          {events.map((e, i) => (
+            <div key={i} style={{ padding: '6px 0', borderBottom: '1px solid #fafafa' }}>
+              <div style={{ fontSize: 12, color: '#666' }}>{(e.rawTimestamp || e.timestamp) ? (e.rawTimestamp || e.timestamp) : (e.time ? e.time.toISOString() : '—')} | {e.vm || '—'} | {e.service || '—'}</div>
+              <div style={{ fontSize: 13 }}>{e.message}</div>
             </div>
           ))}
         </div>
       </div>
-    </div>
+    </>
   )
 }
